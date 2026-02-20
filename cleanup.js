@@ -1,8 +1,8 @@
 // cleanup.js
 import fetch from "node-fetch";
 
-const DOMAIN = process.env.BOLDDESK_DOMAIN;
-const API_KEY = process.env.BOLDDESK_API_KEY;
+const DOMAIN = (process.env.BOLDDESK_DOMAIN || "").trim();
+const API_KEY = (process.env.BOLDDESK_API_KEY || "").trim();
 
 const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
 const DAYS = Number.parseInt(process.env.DAYS || "14", 10);
