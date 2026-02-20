@@ -1,6 +1,6 @@
 # BoldDesk Attachment Retention Cleanup (POC)
 
-This repository contains a zero-infrastructure proof of concept (POC) for automatically deleting attachments from Closed tickets in BoldDesk after a configurable number of days. It runs entirely using GitHub Actions and does not require any servers or paid infrastructure.
+This repository contains a zero-infrastructure proof of concept (POC) for automatically deleting attachments from Closed tickets in BoldDesk after a configurable number of days. It runs entirely using GitHub Actions and does not require any servers or additional paid infrastructure.
 
 This workflow finds tickets where the status is Closed and the closed date is older than a configurable number of days, lists attachments for those tickets, and deletes those attachments using the confirmed working BoldDesk endpoint:
 
