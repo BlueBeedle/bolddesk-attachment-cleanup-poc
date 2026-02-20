@@ -2,11 +2,11 @@
 import fetch from "node-fetch";
 
 /**
- * ENV VARS (from GitHub Actions secrets / workflow env)
+ * ENV VARS
  * - BOLDDESK_DOMAIN (example: investorflow.bolddesk.com)   [NO https://]
  * - BOLDDESK_API_KEY
  * - DRY_RUN (true/false)
- * - DAYS (number of days; 14 for real policy, 0/1 for POC testing)
+ * - DAYS (14 for real, 0/1 for testing)
  * - MAX_DELETES (safety cap)
  */
 
@@ -17,26 +17,21 @@ const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
 const DAYS = Number.parseInt(process.env.DAYS || "14", 10);
 const MAX_DELETES = Number.parseInt(process.env.MAX_DELETES || "200", 10);
 
-if (!DOMAIN || !API_KEY) {
-  throw new Error("Missing BOLDDESK_DOMAIN or BOLDDESK_API_KEY");
-}
+if (!DOMAIN || !API_KEY) throw new Error("Missing BOLDDESK_DOMAIN or BOLDDESK_API_KEY");
 
 if (DOMAIN.includes("http") || DOMAIN.includes("/") || DOMAIN.includes(" ")) {
-  throw new Error(
-    `BOLDDESK_DOMAIN must be host only (no https://, no slashes, no spaces). Received: "${DOMAIN}"`
-  );
+  throw new Error(`BOLDDESK_DOMAIN must be host only (no https://, no slashes, no spaces). Received: "${DOMAIN}"`);
 }
 
 const BASE = `https://${DOMAIN}/api/v1`;
 
-async function bdFetch(path, { method = "GET", body } = {}) {
+async function bdFetch(path, { method = "GET", body, accept = "application/json" } = {}) {
   const url = `${BASE}${path}`;
-
   const res = await fetch(url, {
     method,
     headers: {
       "x-api-key": API_KEY,
-      accept: "application/json",
+      accept,
       ...(body ? { "content-type": "application/json" } : {}),
     },
     ...(body ? { body: JSON.stringify(body) } : {}),
@@ -61,72 +56,54 @@ function isoDaysAgo(days) {
   return d.toISOString();
 }
 
+function normalizeArray(resp) {
+  const arr = resp?.data ?? resp?.result ?? resp;
+  return Array.isArray(arr) ? arr : [];
+}
+
 /**
  * IMPORTANT:
- * This ticket listing endpoint is still a "best guess" placeholder.
- * If you get a 404 here, we must replace this with the exact Swagger path + query params.
+ * This ticket listing endpoint is still a placeholder.
+ * If this 404s, we must replace it with the exact Swagger "list tickets" path + params.
  */
 async function listClosedTicketsOlderThan(days, page = 1, perPage = 100) {
   const cutoffIso = isoDaysAgo(days);
-
-  // Placeholder query parameters:
-  // - status=Closed
-  // - closedOnTo=<ISO> (meaning closed date <= ISO)
-  // - page/perPage
   const path =
     `/tickets?status=Closed` +
     `&closedOnTo=${encodeURIComponent(cutoffIso)}` +
     `&page=${page}&perPage=${perPage}`;
-
   return bdFetch(path);
 }
 
 /**
- * Get Ticket Attachment (you mentioned these params)
- * NOTE: If your Swagger uses different query param names, we’ll update.
+ * Your "Get Ticket Attachment" endpoint (seems valid in your tenant).
+ * We expect each attachment item to include:
+ * - id (attachmentId)
+ * - AND an activity identifier (activityId OR updateId)
  */
 async function listTicketAttachments(ticketId, page = 1, perPage = 50) {
   const path =
     `/tickets/${ticketId}/attachments` +
     `?Page=${page}&PerPage=${perPage}&OrderBy=createdOn%20desc`;
-
   return bdFetch(path);
 }
 
 /**
- * Delete Attachment:
- * Some tenants expose different routes. We try multiple candidates.
+ * CORRECT DELETE based on your dev guide:
+ * DELETE /activities/{activityId}/attachments/{attachmentId}
+ *
+ * Dev guide curl uses:
+ *  -H "accept: text/plain"
  */
-async function deleteAttachment(ticketId, attachmentId) {
-  const candidates = [
-    `/attachments/${attachmentId}`,
-    `/tickets/attachments/${attachmentId}`,
-    `/tickets/${ticketId}/attachments/${attachmentId}`,
-  ];
-
-  let last404 = null;
-
-  for (const path of candidates) {
-    try {
-      return await bdFetch(path, { method: "DELETE" });
-    } catch (e) {
-      const msg = String(e?.message || "");
-      // Only fallback on 404; for 401/403/etc we should stop immediately.
-      if (msg.includes("HTTP 404")) {
-        last404 = e;
-        continue;
-      }
-      throw e;
-    }
-  }
-
-  throw last404 || new Error("Delete failed for all candidate paths");
+async function deleteActivityAttachment(activityId, attachmentId) {
+  const path = `/activities/${activityId}/attachments/${attachmentId}`;
+  return bdFetch(path, { method: "DELETE", accept: "text/plain" });
 }
 
-function normalizeArray(resp) {
-  // Try common response shapes: {data:[]}, {result:[]}, or raw []
-  const arr = resp?.data ?? resp?.result ?? resp;
-  return Array.isArray(arr) ? arr : [];
+function getActivityIdFromAttachment(a) {
+  // BoldDesk docs mention "OrderBy updateId" as a sort option for ticket attachments.
+  // In some responses, updateId is effectively the activity id you need.
+  return a.activityId ?? a.updateId ?? a.activityID ?? a.updateID ?? null;
 }
 
 async function run() {
@@ -134,9 +111,7 @@ async function run() {
   let ticketPage = 1;
   const ticketsPerPage = 100;
 
-  console.log(
-    `Starting cleanup: DAYS=${DAYS}, DRY_RUN=${DRY_RUN}, MAX_DELETES=${MAX_DELETES}`
-  );
+  console.log(`Starting cleanup: DAYS=${DAYS}, DRY_RUN=${DRY_RUN}, MAX_DELETES=${MAX_DELETES}`);
 
   while (true) {
     const ticketResp = await listClosedTicketsOlderThan(DAYS, ticketPage, ticketsPerPage);
@@ -163,22 +138,29 @@ async function run() {
         for (const a of attachments) {
           const attachmentId = a.id ?? a.attachmentId;
           const name = a.name ?? a.fileName ?? "(no name)";
+          const activityId = getActivityIdFromAttachment(a);
 
           if (!attachmentId) continue;
 
+          if (!activityId) {
+            console.log(
+              `[SKIP] Ticket ${ticketId} attachment ${attachmentId} (${name}) missing activityId/updateId; cannot delete via activities endpoint.`
+            );
+            continue;
+          }
+
           if (DRY_RUN) {
             console.log(
-              `[DRY_RUN] Would delete attachment ${attachmentId} (${name}) from ticket ${ticketId}`
+              `[DRY_RUN] Would delete activity attachment ${attachmentId} (${name}) from ticket ${ticketId} (activityId=${activityId})`
             );
           } else {
-            await deleteAttachment(ticketId, attachmentId);
+            await deleteActivityAttachment(activityId, attachmentId);
             console.log(
-              `Deleted attachment ${attachmentId} (${name}) from ticket ${ticketId}`
+              `Deleted activity attachment ${attachmentId} (${name}) from ticket ${ticketId} (activityId=${activityId})`
             );
           }
 
           deletedCount += 1;
-
           if (deletedCount >= MAX_DELETES) {
             console.log(`Reached MAX_DELETES (${MAX_DELETES}). Stopping.`);
             console.log(`Done. Processed deletions (or would-delete): ${deletedCount}`);
