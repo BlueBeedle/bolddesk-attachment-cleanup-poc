@@ -1,6 +1,15 @@
 // cleanup.js
 import fetch from "node-fetch";
 
+/**
+ * ENV VARS (from GitHub Actions)
+ * - BOLDDESK_DOMAIN  (example: investorflow.bolddesk.com)  [NO https://]
+ * - BOLDDESK_API_KEY
+ * - DRY_RUN          ("true" or "false")
+ * - DAYS             (14 for real retention, 0/1 for testing)
+ * - MAX_DELETES      (safety cap)
+ */
+
 const DOMAIN = (process.env.BOLDDESK_DOMAIN || "").trim();
 const API_KEY = (process.env.BOLDDESK_API_KEY || "").trim();
 
@@ -8,15 +17,21 @@ const DRY_RUN = (process.env.DRY_RUN || "true").toLowerCase() === "true";
 const DAYS = Number.parseInt(process.env.DAYS || "14", 10);
 const MAX_DELETES = Number.parseInt(process.env.MAX_DELETES || "200", 10);
 
-if (!DOMAIN || !API_KEY) throw new Error("Missing BOLDDESK_DOMAIN or BOLDDESK_API_KEY");
+if (!DOMAIN || !API_KEY) {
+  throw new Error("Missing BOLDDESK_DOMAIN or BOLDDESK_API_KEY");
+}
+
 if (DOMAIN.includes("http") || DOMAIN.includes("/") || DOMAIN.includes(" ")) {
-  throw new Error(`BOLDDESK_DOMAIN must be host only (no https://, no slashes, no spaces). Received: "${DOMAIN}"`);
+  throw new Error(
+    `BOLDDESK_DOMAIN must be host only (no https://, no slashes, no spaces). Received: "${DOMAIN}"`
+  );
 }
 
 const BASE = `https://${DOMAIN}/api/v1`;
 
 async function bdFetch(path, { method = "GET", body, accept = "application/json" } = {}) {
   const url = `${BASE}${path}`;
+
   const res = await fetch(url, {
     method,
     headers: {
@@ -36,6 +51,7 @@ async function bdFetch(path, { method = "GET", body, accept = "application/json"
     const msg = typeof payload === "string" ? payload : JSON.stringify(payload);
     throw new Error(`HTTP ${res.status} ${res.statusText} - ${msg}`);
   }
+
   return payload;
 }
 
@@ -51,83 +67,54 @@ function normalizeArray(resp) {
 }
 
 /**
- * Placeholder list-tickets endpoint (works in your tenant as-is per your earlier test).
- * If this ever 404s, we’ll swap to the Swagger-confirmed route.
+ * LIST CLOSED TICKETS OLDER THAN X DAYS
+ * (If this ever 404s, we’ll replace with exact Swagger endpoint)
  */
 async function listClosedTicketsOlderThan(days, page = 1, perPage = 100) {
   const cutoffIso = isoDaysAgo(days);
+
   const path =
-    `/tickets?status=Closed&closedOnTo=${encodeURIComponent(cutoffIso)}&page=${page}&perPage=${perPage}`;
+    `/tickets?status=Closed` +
+    `&closedOnTo=${encodeURIComponent(cutoffIso)}` +
+    `&page=${page}&perPage=${perPage}`;
+
   return bdFetch(path);
 }
 
 /**
- * Ticket attachment list endpoint (confirmed working).
+ * LIST ATTACHMENTS FOR A TICKET
  */
 async function listTicketAttachments(ticketId, page = 1, perPage = 50) {
   const path =
-    `/tickets/${ticketId}/attachments?Page=${page}&PerPage=${perPage}&OrderBy=createdOn%20desc`;
+    `/tickets/${ticketId}/attachments` +
+    `?Page=${page}&PerPage=${perPage}&OrderBy=createdOn%20desc`;
+
   return bdFetch(path);
 }
 
 /**
- * Try multiple delete paths and return the first that works.
- * This keeps the POC moving even if Helpdesk gave an incomplete path.
+ * CONFIRMED WORKING DELETE ENDPOINT
+ * DELETE /api/v1/{attachmentId}
  */
-async function deleteAttachmentAuto(ticketId, attachmentId) {
-  const candidates = [
-    // What helpdesk (likely mistakenly) implied:
-    `/${attachmentId}`,
-
-    // Common patterns we tried earlier:
-    `/attachments/${attachmentId}`,
-    `/attachment/${attachmentId}`,
-    `/tickets/attachments/${attachmentId}`,
-    `/tickets/attachment/${attachmentId}`,
-    `/tickets/${ticketId}/attachments/${attachmentId}`,
-
-    // KB pattern helpdesk cited:
-    `/kb/attachment/${attachmentId}`,
-
-    // Activity pattern (needs activityId, which we don't have, but keep here for completeness if their API accepts it):
-    // (Can't call without activityId; omitted)
-
-    // Sometimes api uses "ticketattachments":
-    `/ticketattachments/${attachmentId}`,
-    `/ticket-attachments/${attachmentId}`,
-  ];
-
-  let last404 = null;
-
-  for (const path of candidates) {
-    try {
-      // Delete endpoints often return text/plain
-      await bdFetch(path, { method: "DELETE", accept: "text/plain" });
-      return path; // return which route worked
-    } catch (e) {
-      const msg = String(e?.message || "");
-      if (msg.includes("HTTP 404")) {
-        last404 = e;
-        continue;
-      }
-      // Any non-404 should be surfaced (401/403/500 etc.)
-      throw e;
-    }
-  }
-
-  throw last404 || new Error("All delete endpoint candidates failed");
+async function deleteAttachment(attachmentId) {
+  return bdFetch(`/${attachmentId}`, {
+    method: "DELETE",
+    accept: "text/plain",
+  });
 }
 
 async function run() {
   let processed = 0;
 
-  console.log(`Starting cleanup: DAYS=${DAYS}, DRY_RUN=${DRY_RUN}, MAX_DELETES=${MAX_DELETES}`);
+  console.log(
+    `Starting cleanup: DAYS=${DAYS}, DRY_RUN=${DRY_RUN}, MAX_DELETES=${MAX_DELETES}`
+  );
 
   let page = 1;
-  const perPage = 100;
+  const ticketsPerPage = 100;
 
   while (true) {
-    const ticketResp = await listClosedTicketsOlderThan(DAYS, page, perPage);
+    const ticketResp = await listClosedTicketsOlderThan(DAYS, page, ticketsPerPage);
     const tickets = normalizeArray(ticketResp);
 
     if (tickets.length === 0) {
@@ -140,26 +127,33 @@ async function run() {
       if (!ticketId) continue;
 
       let ap = 1;
-      const perPageAtt = 50;
+      const attachmentsPerPage = 50;
 
       while (true) {
-        const attResp = await listTicketAttachments(ticketId, ap, perPageAtt);
+        const attResp = await listTicketAttachments(ticketId, ap, attachmentsPerPage);
         const attachments = normalizeArray(attResp);
+
         if (attachments.length === 0) break;
 
         for (const a of attachments) {
           const attachmentId = a.id ?? a.attachmentId;
           const name = a.name ?? a.fileName ?? "(no name)";
+
           if (!attachmentId) continue;
 
           if (DRY_RUN) {
-            console.log(`[DRY_RUN] Would delete attachment ${attachmentId} (${name}) from ticket ${ticketId}`);
+            console.log(
+              `[DRY_RUN] Would delete attachment ${attachmentId} (${name}) from ticket ${ticketId}`
+            );
           } else {
-            const route = await deleteAttachmentAuto(ticketId, attachmentId);
-            console.log(`Deleted attachment ${attachmentId} (${name}) from ticket ${ticketId} using DELETE ${route}`);
+            await deleteAttachment(attachmentId);
+            console.log(
+              `Deleted attachment ${attachmentId} (${name}) from ticket ${ticketId}`
+            );
           }
 
           processed += 1;
+
           if (processed >= MAX_DELETES) {
             console.log(`Reached MAX_DELETES (${MAX_DELETES}). Stopping.`);
             console.log(`Done. Processed deletions (or would-delete): ${processed}`);
@@ -167,12 +161,12 @@ async function run() {
           }
         }
 
-        if (attachments.length < perPageAtt) break;
+        if (attachments.length < attachmentsPerPage) break;
         ap += 1;
       }
     }
 
-    if (tickets.length < perPage) break;
+    if (tickets.length < ticketsPerPage) break;
     page += 1;
   }
 
