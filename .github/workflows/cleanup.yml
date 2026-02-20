@@ -26,6 +26,6 @@ jobs:
           BOLDDESK_DOMAIN: ${{ secrets.BOLDDESK_DOMAIN }}
           BOLDDESK_API_KEY: ${{ secrets.BOLDDESK_API_KEY }}
           DRY_RUN: "false"
-          DAYS: "0"
+          DAYS: "14"
           MAX_DELETES: "200"
         run: node cleanup.js
